@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notes</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; margin: 0; padding: 16px; background: #f5f5f3; color: #1a1a1a; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { font-size: 13px; color: #666; margin-bottom: 14px; }
+  .card { background: #fff; border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+  .row { padding: 8px 0; border-bottom: 1px solid #eee; }
+  .row:last-child { border-bottom: 0; }
+  .k { font-size: 12px; color: #777; }
+  .v { font-family: ui-monospace, Menlo, monospace; font-size: 14px; word-break: break-all; }
+  .key .v { font-weight: 600; font-size: 15px; }
+  button { width: 100%; padding: 14px; font-size: 16px; border: 0; border-radius: 10px; background: #1a1a1a; color: #fff; margin-bottom: 10px; }
+  button:disabled { background: #bbb; }
+  #msg { font-size: 14px; padding: 10px; border-radius: 8px; margin-bottom: 12px; display: none; word-break: break-all; }
+  .ok { background: #e3f4e6; color: #1b5e20; }
+  .err { background: #fde8e8; color: #8a1c1c; }
+  .info { background: #eef2f7; color: #234; }
+  textarea { width: 100%; box-sizing: border-box; height: 90px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .net { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 13px; font-weight: 600; }
+  .net.test { background: #fff3cd; color: #7a5600; }
+  .net.main { background: #fde8e8; color: #8a1c1c; }
+</style>
+</head>
+<body>
+<h1>确认</h1>
+<div class="sub">只签名，不发送交易，不花 gas。请以钱包弹窗里显示的内容为准。</div>
+
+<div id="msg"></div>
+
+<div class="card" id="fields"><div class="k">正在读取待签内容…</div></div>
+
+<button id="btnConnect">1. 连接钱包</button>
+<button id="btnSign" disabled>2. 核对后签名</button>
+
+<div class="card" id="out" style="display:none">
+  <div class="k">签名结果（自动回传失败时，复制这段发给发起人）</div>
+  <textarea id="sigText" readonly></textarea>
+  <button id="btnCopy">复制签名</button>
+</div>
+
+<script>
+'use strict';
+var REQ = null, ACCOUNT = null;
+var KEY_FIELDS = ['destination', 'amount', 'signers', 'agentAddress', 'toPerp'];
+var LABEL = {
+  hyperliquidChain: '网络', payloadMultiSigUser: '账户', outerSigner: '提交人',
+  destination: '收款地址', amount: '金额', time: '时间戳', nonce: '时间戳',
+  signers: '新的签名人设置', agentAddress: 'API wallet 地址', agentName: 'API wallet 名称',
+  multiSigActionHash: '提交包哈希', toPerp: '划转方向（true=转入合约）', token: '代币'
+};
+var CHAINS = {
+  '0x66eee': { chainId: '0x66eee', chainName: 'Arbitrum Sepolia', rpcUrls: ['https://sepolia-rollup.arbitrum.io/rpc'],
+               nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, blockExplorerUrls: ['https://sepolia.arbiscan.io'] },
+  '0xa4b1': { chainId: '0xa4b1', chainName: 'Arbitrum One', rpcUrls: ['https://arb1.arbitrum.io/rpc'],
+              nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, blockExplorerUrls: ['https://arbiscan.io'] }
+};
+
+function $(id) { return document.getElementById(id); }
+function show(text, cls) { var m = $('msg'); m.textContent = text; m.className = cls; m.style.display = 'block'; }
+function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+
+function render() {
+  var td = REQ.typedData, m = td.message, html = '';
+  var net = m.hyperliquidChain;
+  html += '<div class="row"><div class="k">操作类型</div><div class="v">' + esc(td.primaryType.split(':').pop()) + '</div></div>';
+  html += '<div class="row"><div class="k">网络</div><div class="v"><span class="net ' + (net === 'Mainnet' ? 'main' : 'test') + '">' + esc(net) + '</span></div></div>';
+  td.types[td.primaryType].forEach(function (f) {
+    if (f.name === 'hyperliquidChain') return;
+    var isKey = KEY_FIELDS.indexOf(f.name) >= 0;
+    html += '<div class="row' + (isKey ? ' key' : '') + '"><div class="k">' + esc(LABEL[f.name] || f.name) + '（' + esc(f.name) + '）</div><div class="v">' + esc(m[f.name]) + '</div></div>';
+  });
+  if (REQ.expectAddress) html += '<div class="row"><div class="k">应由这个地址签名</div><div class="v">' + esc(REQ.expectAddress) + '</div></div>';
+  $('fields').innerHTML = html;
+}
+
+function loadRequest() {
+  if (location.hash.length > 1) {
+    try {
+      var b = location.hash.slice(1).replace(/-/g, '+').replace(/_/g, '/');
+      REQ = JSON.parse(decodeURIComponent(escape(atob(b))));
+      render();
+    } catch (e) { show('链接里的待签内容无法解析：' + e.message, 'err'); }
+    return;
+  }
+  fetch('request.json?t=' + Date.now()).then(function (r) {
+    if (!r.ok) throw new Error('当前没有待签内容');
+    return r.json();
+  }).then(function (j) { REQ = j; render(); })
+    .catch(function (e) { $('fields').innerHTML = '<div class="k">' + esc(e.message) + '</div>'; });
+}
+
+function connect() {
+  if (!window.ethereum) { show('没有检测到钱包。请在 MetaMask / TokenPocket 等钱包 App 自带的浏览器里打开这个页面。', 'err'); return; }
+  window.ethereum.request({ method: 'eth_requestAccounts' }).then(function (a) {
+    ACCOUNT = a[0];
+    if (REQ && REQ.expectAddress && ACCOUNT.toLowerCase() !== REQ.expectAddress.toLowerCase()) {
+      show('当前钱包地址 ' + ACCOUNT + ' 不是这次要签名的地址 ' + REQ.expectAddress + '。请在钱包里切换账户后刷新页面。', 'err');
+      return;
+    }
+    show('已连接：' + ACCOUNT, 'info');
+    $('btnSign').disabled = !REQ;
+  }).catch(function (e) { show('连接失败：' + (e.message || e), 'err'); });
+}
+
+function ensureChain(hexId) {
+  return window.ethereum.request({ method: 'eth_chainId' }).then(function (cur) {
+    if (parseInt(cur, 16) === parseInt(hexId, 16)) return;
+    return window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: hexId }] })
+      .catch(function (e) {
+        if (!CHAINS[hexId]) throw e;
+        return window.ethereum.request({ method: 'wallet_addEthereumChain', params: [CHAINS[hexId]] });
+      });
+  });
+}
+
+function sign() {
+  var td = REQ.typedData;
+  var hexId = '0x' + Number(td.domain.chainId).toString(16);
+  $('btnSign').disabled = true;
+  show('请在钱包弹窗里核对内容后确认…（首次使用可能先提示添加或切换网络，这只是签名用的网络编号，不会发送交易）', 'info');
+  ensureChain(hexId).then(function () {
+    return window.ethereum.request({ method: 'eth_signTypedData_v4', params: [ACCOUNT, JSON.stringify(td)] });
+  }).then(function (sig) {
+    var result = { address: ACCOUNT, signature: sig, id: REQ.id || null };
+    $('sigText').value = JSON.stringify(result);
+    $('out').style.display = 'block';
+    if (location.hash.length > 1) { show('已签名。请复制下面的签名结果发给发起人。', 'ok'); return; }
+    return fetch('signature', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(result) })
+      .then(function (r) { if (!r.ok) throw new Error('回传被拒绝'); show('已签名，并已自动回传给发起人的电脑。可以关闭页面。', 'ok'); })
+      .catch(function () { show('已签名，但自动回传失败。请复制下面的签名结果发给发起人。', 'info'); });
+  }).catch(function (e) {
+    $('btnSign').disabled = false;
+    show('没有签名：' + (e.message || JSON.stringify(e)), 'err');
+  });
+}
+
+$('btnConnect').onclick = connect;
+$('btnSign').onclick = sign;
+$('btnCopy').onclick = function () {
+  var t = $('sigText'); t.select();
+  if (navigator.clipboard) navigator.clipboard.writeText(t.value); else document.execCommand('copy');
+  show('已复制', 'ok');
+};
+loadRequest();
+</script>
+</body>
+</html>
