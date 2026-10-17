@@ -58,14 +58,46 @@
     <label>多签账户地址</label>
     <input id="fMs" placeholder="0x..." autocomplete="off" autocapitalize="off">
     <label>操作</label>
-    <select id="fKind"><option value="usdSend">Hyperliquid 内部转账 USDC</option><option value="withdraw3">提现 USDC 到 Arbitrum</option></select>
-    <label>收款地址</label>
-    <input id="fDest" placeholder="0x..." autocomplete="off" autocapitalize="off">
-    <label>金额（USDC）</label>
-    <input id="fAmt" placeholder="例如 1" inputmode="decimal" autocomplete="off">
+    <select id="fKind">
+      <option value="usdSend">Hyperliquid 内部转账 USDC</option>
+      <option value="withdraw3">提现 USDC 到 Arbitrum</option>
+      <option value="approveAgent">授权 API wallet</option>
+      <option value="setSigners">更换签名人 / 门槛</option>
+      <option value="revert">转回普通账户</option>
+    </select>
+    <div id="gMoney">
+      <label>收款地址</label>
+      <input id="fDest" placeholder="0x..." autocomplete="off" autocapitalize="off">
+      <label>金额（USDC）</label>
+      <input id="fAmt" placeholder="例如 1" inputmode="decimal" autocomplete="off">
+    </div>
+    <div id="gAgent" class="hidden">
+      <label>API wallet 地址</label>
+      <input id="fAgent" placeholder="0x..." autocomplete="off" autocapitalize="off">
+      <label>名称（同名的新授权会顶掉旧的）</label>
+      <input id="fAgentName" placeholder="例如 bot" autocomplete="off" autocapitalize="off">
+    </div>
+    <div id="gSigners" class="hidden">
+      <label>新的签名人地址（每行一个）</label>
+      <textarea id="fSigners" placeholder="0x...&#10;0x..."></textarea>
+      <label>新的门槛</label>
+      <input id="fThreshold" placeholder="例如 2" inputmode="numeric" autocomplete="off">
+    </div>
     <button id="btnLeaderConnect">1. 连接钱包并读取签名人名单</button>
     <div id="signerInfo" class="sub" style="margin-top:10px"></div>
     <button id="btnCreate" disabled>2. 生成请求并签第 1 份</button>
+  </div>
+
+  <div class="card" id="convertCard">
+    <h2>把当前钱包转成多签（只做一次）</h2>
+    <div class="sub">当前连接的钱包签名，把它在 Hyperliquid 上的账户转成多签。转完后这个钱包的私钥不能再单独动用 Hyperliquid 里的资金。签名人必须已经在 Hyperliquid 上有账户。</div>
+    <label>网络</label>
+    <select id="cNet"><option value="Testnet">Testnet（测试网）</option><option value="Mainnet">Mainnet（主网）</option></select>
+    <label>签名人地址（每行一个，不能包括当前钱包自己）</label>
+    <textarea id="cSigners" placeholder="0x...&#10;0x...&#10;0x..."></textarea>
+    <label>门槛</label>
+    <input id="cThreshold" placeholder="例如 2" inputmode="numeric" autocomplete="off">
+    <button id="btnConvert">检查并签名转换</button>
   </div>
 
   <div class="card hidden" id="job">
@@ -94,9 +126,12 @@ const __$G=typeof globalThis!=="undefined"?globalThis:typeof window!=="undefined
 var CORE = (function (E) {
   var ZERO = '0x0000000000000000000000000000000000000000';
   var SIG_CHAIN = '0x66eee';
+  var MONEY = [['destination', 'string'], ['amount', 'string'], ['time', 'uint64']];
   var KINDS = {
-    usdSend: { primary: 'HyperliquidTransaction:UsdSend' },
-    withdraw3: { primary: 'HyperliquidTransaction:Withdraw' }
+    usdSend: { primary: 'HyperliquidTransaction:UsdSend', fields: MONEY },
+    withdraw3: { primary: 'HyperliquidTransaction:Withdraw', fields: MONEY },
+    approveAgent: { primary: 'HyperliquidTransaction:ApproveAgent', fields: [['agentAddress', 'address'], ['agentName', 'string'], ['nonce', 'uint64']] },
+    convertToMultiSigUser: { primary: 'HyperliquidTransaction:ConvertToMultiSigUser', fields: [['signers', 'string'], ['nonce', 'uint64']] }
   };
   var DOMAIN_TYPES = [
     { name: 'name', type: 'string' }, { name: 'version', type: 'string' },
@@ -157,9 +192,33 @@ var CORE = (function (E) {
 
   function domain() { return { name: 'HyperliquidSignTransaction', version: '1', chainId: parseInt(SIG_CHAIN, 16), verifyingContract: ZERO }; }
 
-  function buildInner(kind, chain, dest, amount, nonce) {
-    if (!KINDS[kind]) throw new Error('不支持的操作');
-    return { type: kind, signatureChainId: SIG_CHAIN, hyperliquidChain: chain, destination: dest.toLowerCase(), amount: amount, time: nonce };
+  // 和 Python json.dumps 默认格式一致的签名人设置字符串
+  function signersJson(users, threshold) {
+    var u = users.map(function (x) { return x.toLowerCase(); }).sort();
+    return '{"authorizedUsers": [' + u.map(function (x) { return '"' + x + '"'; }).join(', ') + '], "threshold": ' + Number(threshold) + '}';
+  }
+
+  // p: { dest, amount } | { agentAddress, agentName } | { signers }
+  function buildInner(kind, chain, p, nonce) {
+    var base = { type: kind, signatureChainId: SIG_CHAIN, hyperliquidChain: chain };
+    if (kind === 'usdSend' || kind === 'withdraw3') { base.destination = p.dest.toLowerCase(); base.amount = p.amount; base.time = nonce; }
+    else if (kind === 'approveAgent') { base.agentAddress = p.agentAddress.toLowerCase(); base.agentName = p.agentName; base.nonce = nonce; }
+    else if (kind === 'convertToMultiSigUser') { base.signers = p.signers; base.nonce = nonce; }
+    else throw new Error('不支持的操作');
+    return base;
+  }
+
+  function innerNonce(inner) { return inner.time !== undefined ? inner.time : inner.nonce; }
+
+  // 普通账户自己转成多签（单签，不经过多签包装）
+  function singleConvert(chain, users, threshold, nonce) {
+    var signers = signersJson(users, threshold);
+    var action = { type: 'convertToMultiSigUser', signers: signers, nonce: nonce, signatureChainId: SIG_CHAIN, hyperliquidChain: chain };
+    var types = { 'HyperliquidTransaction:ConvertToMultiSigUser': [
+      { name: 'hyperliquidChain', type: 'string' }, { name: 'signers', type: 'string' }, { name: 'nonce', type: 'uint64' }
+    ], EIP712Domain: DOMAIN_TYPES };
+    return { action: action, typed: { domain: domain(), types: types, primaryType: 'HyperliquidTransaction:ConvertToMultiSigUser',
+             message: { hyperliquidChain: chain, signers: signers, nonce: nonce } } };
   }
 
   function innerTyped(inner, msUser, outer) {
@@ -167,17 +226,12 @@ var CORE = (function (E) {
     var types = {};
     types[primary] = [
       { name: 'hyperliquidChain', type: 'string' }, { name: 'payloadMultiSigUser', type: 'address' },
-      { name: 'outerSigner', type: 'address' }, { name: 'destination', type: 'string' },
-      { name: 'amount', type: 'string' }, { name: 'time', type: 'uint64' }
-    ];
+      { name: 'outerSigner', type: 'address' }
+    ].concat(KINDS[inner.type].fields.map(function (f) { return { name: f[0], type: f[1] }; }));
     types.EIP712Domain = DOMAIN_TYPES;
-    return {
-      domain: domain(), types: types, primaryType: primary,
-      message: {
-        hyperliquidChain: inner.hyperliquidChain, payloadMultiSigUser: msUser.toLowerCase(), outerSigner: outer.toLowerCase(),
-        destination: inner.destination, amount: inner.amount, time: inner.time
-      }
-    };
+    var message = { hyperliquidChain: inner.hyperliquidChain, payloadMultiSigUser: msUser.toLowerCase(), outerSigner: outer.toLowerCase() };
+    KINDS[inner.type].fields.forEach(function (f) { message[f[0]] = inner[f[0]]; });
+    return { domain: domain(), types: types, primaryType: primary, message: message };
   }
 
   function multiSigAction(inner, msUser, outer, sigs) {
@@ -203,6 +257,7 @@ var CORE = (function (E) {
   function apiBase(chain) { return chain === 'Mainnet' ? 'https://api.hyperliquid.xyz' : 'https://api.hyperliquid-testnet.xyz'; }
 
   return { msgpack: msgpack, actionHash: actionHash, sigObj: sigObj, buildInner: buildInner, innerTyped: innerTyped,
+           signersJson: signersJson, singleConvert: singleConvert, innerNonce: innerNonce,
            multiSigAction: multiSigAction, envelopeTyped: envelopeTyped, recover: recover, apiBase: apiBase, SIG_CHAIN: SIG_CHAIN };
 })(typeof ethers !== 'undefined' ? ethers : require('ethers'));
 if (typeof module !== 'undefined') module.exports = CORE;
@@ -213,9 +268,10 @@ if (typeof module !== 'undefined') module.exports = CORE;
 var E = ethers, ACCOUNT = null, REQ = null, JOB = null, SIGNERS = null;
 var LABEL = {
   hyperliquidChain: '网络', payloadMultiSigUser: '账户', outerSigner: '提交人', destination: '收款地址',
-  amount: '金额', time: '时间戳', nonce: '时间戳', multiSigActionHash: '提交包哈希'
+  amount: '金额', time: '时间戳', nonce: '时间戳', multiSigActionHash: '提交包哈希',
+  agentAddress: 'API wallet 地址', agentName: 'API wallet 名称', signers: '签名人设置（null = 转回普通账户）'
 };
-var KEY_FIELDS = ['destination', 'amount'];
+var KEY_FIELDS = ['destination', 'amount', 'agentAddress', 'signers'];
 var ARB_SEPOLIA = { chainId: '0x66eee', chainName: 'Arbitrum Sepolia', rpcUrls: ['https://sepolia-rollup.arbitrum.io/rpc'],
                     nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 }, blockExplorerUrls: ['https://sepolia.arbiscan.io'] };
 
@@ -301,9 +357,26 @@ function copy(el) {
   show('已复制', 'ok');
 }
 
+function parseSigners(text, tText, self) {
+  var users = text.split(/[\s,]+/).filter(Boolean).map(function (x) { return x.toLowerCase(); });
+  var t = Number(tText);
+  if (!users.length) return { err: '请填签名人地址' };
+  for (var i = 0; i < users.length; i++) if (!isAddr(users[i])) return { err: '地址格式不对：' + users[i] };
+  if (new Set(users).size !== users.length) return { err: '签名人地址有重复' };
+  if (users.length > 10) return { err: '签名人最多 10 个' };
+  if (self && users.indexOf(self.toLowerCase()) >= 0) return { err: '签名人不能包括账户自己' };
+  if (!Number.isInteger(t) || t < 1 || t > users.length) return { err: '门槛必须是 1 到 ' + users.length + ' 之间的整数' };
+  return { users: users, t: t };
+}
+
+function userRole(chain, a) {
+  return fetch(CORE.apiBase(chain) + '/info', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'userRole', user: a }) }).then(function (r) { return r.json(); });
+}
+
 function renderJob() {
-  if (!JOB) { $('job').classList.add('hidden'); $('newJob').classList.remove('hidden'); return; }
-  $('newJob').classList.add('hidden'); $('job').classList.remove('hidden');
+  if (!JOB) { $('job').classList.add('hidden'); $('newJob').classList.remove('hidden'); $('convertCard').classList.remove('hidden'); return; }
+  $('newJob').classList.add('hidden'); $('convertCard').classList.add('hidden'); $('job').classList.remove('hidden');
   $('jobFields').innerHTML = fieldsHtml(JOB.typed) +
     '<div class="row"><div class="k">门槛</div><div class="v">' + JOB.threshold + ' 份签名</div></div>';
   $('shareLink').value = location.origin + location.pathname + '#' + b64enc({ id: JOB.id, typedData: JOB.typed });
@@ -332,19 +405,43 @@ function initLeader() {
     }).catch(function (e) { show('失败：' + (e.message || e), 'err'); });
   };
 
+  $('fKind').onchange = function () {
+    var k = $('fKind').value;
+    $('gMoney').classList.toggle('hidden', !(k === 'usdSend' || k === 'withdraw3'));
+    $('gAgent').classList.toggle('hidden', k !== 'approveAgent');
+    $('gSigners').classList.toggle('hidden', k !== 'setSigners');
+  };
+
   $('btnCreate').onclick = function () {
-    var ms = $('fMs').value.trim().toLowerCase(), chain = $('fNet').value, kind = $('fKind').value;
-    var dest = $('fDest').value.trim(), amt = $('fAmt').value.trim();
-    if (!isAddr(dest)) { show('收款地址格式不对', 'err'); return; }
-    if (!/^\d+(\.\d+)?$/.test(amt) || Number(amt) <= 0) { show('金额格式不对', 'err'); return; }
+    var ms = $('fMs').value.trim().toLowerCase(), chain = $('fNet').value, kind = $('fKind').value, p, realKind = kind;
+    if (kind === 'usdSend' || kind === 'withdraw3') {
+      var dest = $('fDest').value.trim(), amt = $('fAmt').value.trim();
+      if (!isAddr(dest)) { show('收款地址格式不对', 'err'); return; }
+      if (!/^\d+(\.\d+)?$/.test(amt) || Number(amt) <= 0) { show('金额格式不对', 'err'); return; }
+      if (dest.toLowerCase() === ms) { show('收款地址不能是多签账户自己', 'err'); return; }
+      p = { dest: dest, amount: amt };
+    } else if (kind === 'approveAgent') {
+      var ag = $('fAgent').value.trim(), nm = $('fAgentName').value.trim();
+      if (!isAddr(ag)) { show('API wallet 地址格式不对', 'err'); return; }
+      if (!/^[A-Za-z0-9_-]{1,16}$/.test(nm)) { show('名称只能用英文字母、数字、- 或 _，最长 16 个字符', 'err'); return; }
+      p = { agentAddress: ag, agentName: nm };
+    } else if (kind === 'setSigners') {
+      var r = parseSigners($('fSigners').value, $('fThreshold').value, ms);
+      if (r.err) { show(r.err, 'err'); return; }
+      if (!confirm('新的签名人：\n' + r.users.join('\n') + '\n门槛：' + r.t + '\n\n请确认每个地址都有人持有私钥，否则资金可能永久锁死。')) return;
+      p = { signers: CORE.signersJson(r.users, r.t) }; realKind = 'convertToMultiSigUser';
+    } else if (kind === 'revert') {
+      if (!confirm('转回普通账户后，原来那个钱包的私钥会重新单独控制这个账户。确定？')) return;
+      p = { signers: 'null' }; realKind = 'convertToMultiSigUser';
+    }
     if (chain === 'Mainnet' && !confirm('这是主网，真实资金。确定继续？')) return;
     var nonce = Date.now();
-    var inner = CORE.buildInner(kind, chain, dest, amt, nonce);
+    var inner = CORE.buildInner(realKind, chain, p, nonce);
     var typed = CORE.innerTyped(inner, ms, ACCOUNT);
     $('btnCreate').disabled = true;
     show('请在钱包弹窗和硬件设备上核对后确认（第 1 份签名）…', 'info');
     walletSign(typed).then(function (sig) {
-      JOB = { id: String(nonce), chain: chain, ms: ms, outer: ACCOUNT, inner: inner, typed: typed, nonce: nonce,
+      JOB = { id: String(nonce), chain: chain, ms: ms, outer: ACCOUNT, inner: inner, typed: typed, nonce: CORE.innerNonce(inner),
               threshold: SIGNERS.threshold, users: SIGNERS.users, sigs: [{ addr: ACCOUNT, sig: sig }] };
       store('job', JOB); renderJob();
       show('已签第 1 份。复制链接发给其他签名人，再把他们发回的签名结果粘贴进来。', 'ok');
@@ -352,6 +449,34 @@ function initLeader() {
   };
 
   $('btnCopyLink').onclick = function () { copy($('shareLink')); };
+
+  $('btnConvert').onclick = function () {
+    var chain = $('cNet').value, r;
+    connectWallet().then(function (me) {
+      r = parseSigners($('cSigners').value, $('cThreshold').value, me);
+      if (r.err) throw new Error(r.err);
+      return fetchSigners(chain, me).then(function (cur) {
+        if (cur && cur.authorizedUsers) throw new Error('当前钱包 ' + me + ' 已经是多签账户了');
+        return Promise.all(r.users.map(function (u) { return userRole(chain, u); }));
+      }).then(function (roles) {
+        var missing = r.users.filter(function (u, i) { return !roles[i] || roles[i].role === 'missing'; });
+        if (missing.length) throw new Error('这些签名人在 ' + chain + ' 上还没有账户，先给它们转一点 USDC 激活：\n' + missing.join('\n'));
+        if (!confirm('把 ' + me + '（' + chain + '）转成多签？\n\n签名人：\n' + r.users.join('\n') + '\n门槛：' + r.t +
+                     '\n\n转完后这个钱包的私钥不能再单独动用 Hyperliquid 里的资金。')) throw new Error('已取消');
+        var nonce = Date.now(), sc = CORE.singleConvert(chain, r.users, r.t, nonce);
+        show('请在钱包和硬件设备上核对签名人设置后确认…', 'info');
+        return walletSign(sc.typed).then(function (sig) {
+          return fetch(CORE.apiBase(chain) + '/exchange', { method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ action: sc.action, nonce: nonce, signature: CORE.sigObj(sig), vaultAddress: null, expiresAfter: null }) });
+        }).then(function (res) { return res.text(); }).then(function (text) {
+          var j; try { j = JSON.parse(text); } catch (e) { j = null; }
+          if (!(j && j.status === 'ok')) throw new Error('Hyperliquid 拒绝：' + text);
+          $('fMs').value = me; $('fNet').value = chain; store('lastMs', me);
+          show('✅ 已转成多签：' + text + '\n之后在 App 里切换到某个签名人的账户，再用上面的「发起」操作。', 'ok');
+        });
+      });
+    }).catch(function (e) { show(e.message || JSON.stringify(e), 'err'); });
+  };
 
   $('btnAddSig').onclick = function () {
     var body;
